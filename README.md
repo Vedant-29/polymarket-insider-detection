@@ -39,10 +39,33 @@ cd polymarket-insider-detection
 cp .env.example .env        # set ALCHEMY_API_KEY and DATABASE_URL
 createdb polymarket_insider
 npm install
-npm run db:migrate
+psql -d polymarket_insider -f drizzle/migrations/0000_illegal_jamie_braddock.sql
 ```
 
-`db:migrate` creates the six tables (`trades`, `markets`, `market_manipulability`, `wallet_first_funding`, `wallet_scores`, `indexer_state`).
+The SQL file creates the six tables (`trades`, `markets`, `market_manipulability`, `wallet_first_funding`, `wallet_scores`, `indexer_state`). Apply it with `psql` rather than `npm run db:migrate`: that script needs `drizzle/migrations/meta/_journal.json`, which is gitignored, so on a fresh clone it fails with "Can't find meta/_journal.json file".
+
+## Services
+
+Bring your own Alchemy key. The other two outside services are public and need no account.
+
+| Service | Used for | Required | Env vars |
+|---|---|---|---|
+| PostgreSQL | Stores trades, markets, funding and scores | Yes | `DATABASE_URL` |
+| Alchemy (Polygon Mainnet) | Live `OrderFilled` WebSocket, wallet funding lookups | Yes, for `live` and `backfill:funding` | `ALCHEMY_API_KEY` |
+| Goldsky orderbook subgraph | Historical trade backfill | Yes, for `backfill:trades` | None |
+| Polymarket Gamma API | Market question, end date, liquidity, outcome | Yes, for `enrich:*` and `live` | None |
+
+### PostgreSQL
+
+Any local Postgres 16 works. The full October to November 2025 window is about 56 million trade rows, so leave plenty of disk space.
+
+### Alchemy
+
+In the Alchemy dashboard, create an app on Polygon Mainnet and copy its API key. The code builds both `https://polygon-mainnet.g.alchemy.com/v2/<key>` and the matching `wss://` URL from it. Funding lookups call `alchemy_getAssetTransfers`, which is Alchemy-specific, so a generic Polygon RPC will not work. The free tier is enough.
+
+### Goldsky and Gamma
+
+The backfill pages through Polymarket's public orderbook subgraph on Goldsky (`api.goldsky.com`, URL hardcoded in `src/indexer/`). Market data comes from `https://gamma-api.polymarket.com`. Neither needs a key.
 
 ## Environment variables
 
@@ -50,7 +73,7 @@ npm run db:migrate
 |---|---|---|---|
 | `ALCHEMY_API_KEY` | Yes | Polygon RPC and WebSocket, funding lookups | alchemy.com > Create app > Polygon Mainnet |
 | `DATABASE_URL` | Yes | Postgres connection | Default `postgres://localhost:5432/polymarket_insider` |
-| `BACKFILL_MONTHS` | No | Months back for the single-cursor backfill (default 9) | Choose a value |
+| `BACKFILL_MONTHS` | No | Months back for the single-cursor backfill in `src/indexer/trades-backfill.ts` (default 9). Not used by `backfill:trades` | Choose a value |
 | `FUNDING_MIN_USDC` | No | Minimum biggest trade for a wallet to get a funding lookup (default 5000) | Choose a value |
 
 ## Usage
@@ -69,12 +92,20 @@ npm run validate
 npm run leaderboard
 ```
 
-Run `ANALYZE` after the backfill. The later queries are slow without it.
+Run `ANALYZE` after the backfill. The later queries are slow without it. `backfill:trades` defaults to 12 workers, `--from 2025-10-31T06:19:00Z` and `--to` now when the flags are left out. `validate` overwrites `docs/validation-results.json`.
 
 If a backfill worker dies on a transient `fetch failed`, resume only that worker:
 
 ```sh
 npm run backfill:trades:resume -- --name trades-w4 --to 2025-10-16T05:59:59Z
+```
+
+Other commands:
+
+```sh
+npm run leaderboard -- 100                  # top 100 wallets instead of the default 50
+npx tsx src/cli/test-manipulability.ts      # check the market filter on 7 synthetic markets (needs DATABASE_URL set)
+npx tsx src/indexer/trades-backfill.ts      # older single-cursor backfill, reads BACKFILL_MONTHS
 ```
 
 Watch trades live and flag them as they happen:
@@ -93,6 +124,7 @@ npm run live
 
 - The indexed window is October to November 2025. Three of the eight wallets in `data/known_insiders.json` (Maduro 1, Maduro 2, Israel/Iran reactivation) traded in January 2026 and are outside it.
 - Spotify Wrapped and DraftKings are missed on purpose at the current threshold. Lowering it to 45 catches 4 of 5 but raises the random false positive rate from 4% to about 15%.
+- The flag threshold (60) is a constant in `src/detection/score.ts` and `src/indexer/trades-live.ts`, not an env var.
 - Since April 28, 2026 Polymarket trades only on the V2 exchange. The live indexer handles both event shapes.
 
 ## License
